@@ -19,15 +19,15 @@ debouncing).
 # TODO: Implement callbacks for press/release/repeat.
 #       Might be useful to implement a background thread for polling the state.
 # TODO: Implement hold and hold_repeat. Look at HoldMixin.
+# TODO/IDEA: Create pseudo-devices for each button.
 
 from collections import defaultdict
-from threading import Lock, Timer
+from threading import Lock
 
 from gpiozero.devices import CompositeDevice, GPIODevice
-from gpiozero.input_devices import InputDevice
-from gpiozero.mixins import EventsMixin, HoldMixin
+from gpiozero.mixins import HoldMixin
 
-class MatrixKeypad(CompositeDevice):
+class MatrixKeypad(HoldMixin, CompositeDevice):
     # rows = list of pins (usually 4 pins)
     # cols = list of pins (usually 3 or 4 pins)
     # labels = One of:   list of list  |  list of strings
@@ -38,11 +38,18 @@ class MatrixKeypad(CompositeDevice):
     #            ["123A", "456B", "789C", "*0#D"]
     #            [ [1, 2, 3], [4, 5, 6], [7, 8, 9]]
     # output_format = Formats the :attr:`value` in different ways. Check :meth:`_format_value` for the available formats.
+    # hold_time = See HoldMixin. Or just copy-paste the description from Button and form ButtonBoard
+    # hold_repeat = See HoldMixin. Or just copy-paste the description from Button and form ButtonBoard
     #
-    # Deboucing is not implemented here, because we are probing the values at a certain (low enough) frequency.
-    def __init__(self, rows, cols, labels, *, output_format="labels",
-                 # hold_time=1, hold_repeat=False,
-                 pin_factory=None):
+    # Debouncing is not implemented here, because we are probing the values at a certain (low enough) frequency.
+    #
+    # Rant: HoldMixin and EventsMixin have a weird and poorly documented magic method `_wrap_callback`.
+    #       Also, those two mixins should call the callbacks passing the new
+    #       device state, or let the subclasses provide such feature. Why? Want
+    #       to to pass which keys have changed. I'll have to implement it myself.
+    def __init__(
+            self, rows, cols, labels, *, output_format="labels", hold_time=1,
+            hold_repeat=False, pin_factory=None):
         if len(labels) == 0:
             raise ValueError("labels must not be empty")
         if len(labels) != len(rows):
@@ -61,14 +68,22 @@ class MatrixKeypad(CompositeDevice):
 
         self._last_read_was_ambiguous = False
         self._last_value = None # Set of (rowno, colno)
+        self._previous_value = None # Set of (rowno, colno)
 
         self._probe_lock = Lock()
         self._reset_pins()
+
+        # Call _fire_events once to set initial state of events
+        self._fire_events(self.pin_factory.ticks(), self.is_active)
+        self.hold_time = hold_time
+        self.hold_repeat = hold_repeat
 
     @property
     def value(self):
         """
         Queries the keypad to read a new value.
+
+        When reacting from a callback, please consider :attr:`last_value` instead.
         """
         return self._format_value(self._read())
 
@@ -182,7 +197,9 @@ class MatrixKeypad(CompositeDevice):
             if potentially_ambiguous:
                 self._last_read_was_ambiguous = self.is_it_ambiguous(pressed)
 
+            self._previous_value = self._last_value
             self._last_value = pressed
+            self._fire_events(self.pin_factory.ticks(), self.is_active)
             return pressed
 
     @property
