@@ -2,24 +2,53 @@
 
 print('''
 ##### WARNING #####
-This code is FAR from ready.
-
-My next approach will be simplified: the class will work in two ways: either
-manual probing (the user of the class will call a method or read from a
-property/generator to trigger the probing), or automatic probing (a background
-thread that will probe the values at a certain frequency, with optional
-debouncing).
-
+This code is NOT ready yet.
 ''')
 
-# This code is loosely inspired by:
-# * https://github.com/adafruit/Adafruit_CircuitPython_MatrixKeypad/blob/main/adafruit_matrixkeypad.py
-# * https://github.com/brettmclean/pad4pi/blob/develop/pad4pi/rpi_gpio.py
+# I have a new idea:
+#
+# * Create a pseudo-button class that inherits from `HoldMixin` and
+#   `InternalDevice`.
+# * Make `MatrixKeypad` be a composite device of all these fake buttons.
+# * Store the row/col pins outside the `CompositeDevice` stuff.
+# * Override `close()` and `closed`. They should act on the row/col pins.
+# * Override `__repr__`, if I can think of a better representation.
+# * Let the buttons be accessible in multiple ways:
+#     * By single index (`CompositeDevice` already provides that).
+#     * By (rowno, colno).
+#     * By label (`CompositeDevice` provides a limited version of that,
+#       because only valid identifiers are accessible), either by
+#       attribute or in a dict-like interface.
+# * Provide some custom callback code that passes the exact buttons as
+#   parameters. This involves passing and/or comparing `_previous_value`
+#   with `_last_value`.
+#     * Parameters
+#         * Current key state
+#         * Previous key state
+#         * Newly-pressed keys (redundant?)
+#         * Newly-released keys (redundant?)
+#         * Is it ambiguous now? Was it ambiguous before?
+#     * Callbacks
+#         * Key press (which ones are now pressed?)
+#         * Key release (which ones are now released?)
+#         * Key hold (do I need it?)
+#         * KeypadChange (one callback to rule them all)
+#
+# Advantages:
+#
+# * `HoldMixin` will work out-of-the-box, because it will handle a single
+#   button.
+# * No one will accidentally touch the hardware pins by accidentally using
+#   the `CompositeDevice` interface.
+# * Easy-to-use for people who want to make the keypad behave like a
+#   keyboard (i.e. one callback for all buttons).
+# * Easy-to-use for people who want finer access to individual buttons.
+#
+# For this new implementation idea, it might be worth reverting to the
+# previous commit (the one without HoldMixin).
+#
+# I'll still need to implement an optional background polling thread.
 
-# TODO: Implement callbacks for press/release/repeat.
-#       Might be useful to implement a background thread for polling the state.
-# TODO: Implement hold and hold_repeat. Look at HoldMixin.
-# TODO/IDEA: Create pseudo-devices for each button.
 
 from collections import defaultdict
 from threading import Lock
@@ -28,6 +57,9 @@ from gpiozero.devices import CompositeDevice, GPIODevice
 from gpiozero.mixins import HoldMixin
 
 class MatrixKeypad(HoldMixin, CompositeDevice):
+    # TODO: Convert this into a nicely formatted docstring.
+    # TODO: Check if all the docstrings are properly formatted.
+    #
     # rows = list of pins (usually 4 pins)
     # cols = list of pins (usually 3 or 4 pins)
     # labels = One of:   list of list  |  list of strings
@@ -289,18 +321,3 @@ if __name__ == "__main__":
     #         time.sleep(1)
 
     input('Press Enter to quit.')
-
-# from pad4pi.rpi_gpio import KeypadFactory
-# 
-# def printkey(key):
-#     print(key)
-# 
-# kp = KeypadFactory().create_keypad(
-#     keypad=["123A", "456B", "789C", "*0#D"],
-#     # pin 21 is not used in this 3x4 matrix
-#     row_pins=[19, 26, 16, 20],
-#     col_pins=[5, 6, 13],
-# )
-# kp.registerKeyPressHandler(printkey)
-# input('Press Enter to quit.')
-# kp.cleanup()
