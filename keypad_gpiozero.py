@@ -4,48 +4,6 @@ print('''
 ##### WARNING #####
 This code is FAR from ready.
 
-
-I tested this code with a 3x4 keypad (`12345679*0#`). It doesn't work well.
-The probing code seems to work, but everything else around it is messy and
-unreliable. I'm abandoning this code for now.
-
-I originally tried to pick the best of these two pieces of code:
-https://github.com/brettmclean/pad4pi/blob/develop/pad4pi/rpi_gpio.py
-https://github.com/adafruit/Adafruit_CircuitPython_MatrixKeypad/blob/main/adafruit_matrixkeypad.py
-Plus bits from gpiozero's ButtonBoard and Rotary Encoder.
-
-My idea was to use interrupts to get notified of button state changes, and then
-react to those by probing all the keys to find the real states of the buttons,
-and then revert back to waiting.
-
-Sidenote: these aren't real interrupts; the `raspberry-gpio-python` internally
-runs a polling loop to look for changes, and then calls your callback. It gives
-the illusion of interrupts, but they are technically not interrupts. Or maybe
-they are, and I completely misunderstood the code while taking a quick look.
-https://sourceforge.net/p/raspberry-gpio-python/code/ci/default/tree/source/event_gpio.c#l357
-
-Unfortunately, it didn't work as intended. Since the polling and the callback
-run in a different thread, I'm now dealing with racing conditions and all the
-trouble that comes with multi-thread coding (with the extra difficulty that I
-don't have control over the other threads).
-
-When I was pressing buttons from the first two columns (`147`, `258`),
-everything worked fine (or good enough). However, randomly when pressing
-buttons on the third column (`369`) the code would enter an infinite callback
-loop. It seemed like the `_probe_keypad` would finish the setup and reactivate
-the callbacks too quickly, so the library code was detecting some edge change
-on the pin 13 and calling my callback, which would trigger another probe, which
-would self-sustain this madness. Why only on pin 13? Was it because it was the
-last one in the columns loop. Or maybe it was luck (AKA racing condition).
-
-My last hope was to try adding a basic debouncing code by using a `Timer`
-object. Well, that works, the infinite calling of callbacks was halted. But it
-also means the code is now eating inputs, so it is unreliable in a different
-way.
-
-For now, I give up on this approach. If someone else wants to give it a try, be
-my guest. Maybe someone somewhere will be able to make it work.
-
 My next approach will be simplified: the class will work in two ways: either
 manual probing (the user of the class will call a method or read from a
 property/generator to trigger the probing), or automatic probing (a background
@@ -54,13 +12,19 @@ debouncing).
 
 ''')
 
-from functools import partial
+# This code is loosely inspired by:
+# * https://github.com/adafruit/Adafruit_CircuitPython_MatrixKeypad/blob/main/adafruit_matrixkeypad.py
+# * https://github.com/brettmclean/pad4pi/blob/develop/pad4pi/rpi_gpio.py
+
+# TODO: Implement callbacks for press/release/repeat.
+#       Might be useful to implement a background thread for polling the state.
+# TODO: Implement hold and hold_repeat. Look at HoldMixin.
+
+from collections import defaultdict
 from threading import Lock, Timer
-import traceback
 
 from gpiozero.devices import CompositeDevice, GPIODevice
 from gpiozero.input_devices import InputDevice
-from gpiozero.output_devices import OutputDevice
 from gpiozero.mixins import EventsMixin, HoldMixin
 
 class MatrixKeypad(CompositeDevice):
@@ -73,9 +37,11 @@ class MatrixKeypad(CompositeDevice):
     #          Examples:
     #            ["123A", "456B", "789C", "*0#D"]
     #            [ [1, 2, 3], [4, 5, 6], [7, 8, 9]]
-    # bounce_time = must be implemented by myself, because of the polling behavior across the matrix
-    def __init__(self, rows, cols, labels, *,
-                 # bounce_time=None, hold_time=1, hold_repeat=False,
+    # output_format = Formats the :attr:`value` in different ways. Check :meth:`_format_value` for the available formats.
+    #
+    # Deboucing is not implemented here, because we are probing the values at a certain (low enough) frequency.
+    def __init__(self, rows, cols, labels, *, output_format="labels",
+                 # hold_time=1, hold_repeat=False,
                  pin_factory=None):
         if len(labels) == 0:
             raise ValueError("labels must not be empty")
@@ -84,23 +50,86 @@ class MatrixKeypad(CompositeDevice):
         if any(len(labelrow) != len(cols) for labelrow in labels):
             raise ValueError("Each element from labels must have the same length as cols (pins)")
 
+        # Should we make a copy of the labels? Or should we just keep a reference?
+        # Since we don't use the labels internally for anything, we can just keep a reference.
         self.labels = labels
+
+        self.output_format = output_format
         self.row_pins = [ GPIODevice(pin, pin_factory=pin_factory) for pin in rows ]
         self.col_pins = [ GPIODevice(pin, pin_factory=pin_factory) for pin in cols ]
-        super().__init__(*self.row_pins, *self.col_pins, pin_factory=pin_factory)
-        self._handlers = []
-        self._when_changed_lock = Lock()
-        self._disable_when_changed_handler = False
+        super(MatrixKeypad, self).__init__(*self.row_pins, *self.col_pins, pin_factory=pin_factory)
+
+        self._last_read_was_ambiguous = False
+        self._last_value = None # Set of (rowno, colno)
+
+        self._probe_lock = Lock()
         self._reset_pins()
-        self._setup_pins_for_waiting()
+
+    @property
+    def value(self):
+        """
+        Queries the keypad to read a new value.
+        """
+        return self._format_value(self._read())
+
+    @value.setter
+    def value(self, value):
+        pass
+
+    @property
+    def last_value(self):
+        """
+        Returns the last known value from the keypad.
+
+        This gets updated automatically each time :attr:`value` is accessed.
+        (Which also happens each time :attr:`values` is consumed.)
+        """
+        return self._format_value(self._last_value)
+
+    @property
+    def is_active(self):
+        return self._last_value and len(self._last_value) > 0
+
+    def _format_value(self, set_of_tuples):
+        """
+        Formats the internal value format to an easier format to the end-user.
+
+        Possible formats:
+
+        * labels: Returns a frozenset of the labels of the pressed buttons.
+                  e.g. { "A", "B" }  # If the labels are strings
+                  e.g. { 4, 7 }      # If the labels are numbers
+        * coords: Returns a frozenset of the 0-based coords (row, col) of the pressed buttons.
+                  e.g. { (0, 0), (2, 3) }
+        * rowfirstsequence:
+        * colfirstsequence:
+                  Return a tuple of the state of each button.
+                  Useful for setting as a source of a LEDBoard.
+                  e.g. (False, False, True, False, False, False, False, False, False)
+        """
+        if self.output_format in "coords":
+            return frozenset(set_of_tuples)
+        elif self.output_format in "labels":
+            return frozenset(self.labels[rowno][colno] for (rowno, colno) in set_of_tuples)
+        elif self.output_format in "colfirstsequence":
+            return tuple(
+                (rowno, colno) in set_of_tuples
+                for colno in range(len(self.col_pins))
+                for rowno in range(len(self.row_pins))
+            )
+        elif self.output_format in "rowfirstsequence":
+            return tuple(
+                (rowno, colno) in set_of_tuples
+                for rowno in range(len(self.row_pins))
+                for colno in range(len(self.col_pins))
+            )
+        else:
+            raise ValueError("Unsupported value for 'output_format': {}".format(self.output_format))
 
     def _reset_pins(self):
         """
         Resets the pins to be all INPUT, avoiding any short-circuit risk.
-
-        The rest of this class assumes this function was called at least once.
         """
-        self._handlers = []
         for p in self.row_pins + self.col_pins:
             p.pin.when_changed = None
 
@@ -108,120 +137,123 @@ class MatrixKeypad(CompositeDevice):
             p.pin.input_with_pull('up')
             p.pin.bounce = None
 
-    def _setup_pins_for_waiting(self):
-        """
-        Configures the pins so that any state change (button press or release)
-        can be detected immediately. The actual state change has to be queried
-        later.
-
-        All rows are set to OUTPUT LOW, and all columns are set to INPUT with
-        edge detection.
-        """
-
-        self._handlers = []
-        for p in self.col_pins:
-            p.pin.when_changed = None
-
-        for p in self.row_pins:
-            p.pin.output_with_state(0)
-
-        for p in self.col_pins:
-            p.pin.input_with_pull('up')
-            #p.pin.when_changed = self._when_changed_handler
-
-            f = partial(self._when_changed_handler, pinno=p.pin._number)
-            self._handlers.append(f)
-            p.pin.when_changed = f
-
-            # Note: although the documentation claims "none" is a valid value,
-            # it's not supported by rpigpio.py
-            p.pin.edges = 'both'
-
-    def _when_changed_handler(self, ticks=None, state=None, *, pinno=None):
-        with self._when_changed_lock:
-            #traceback.print_stack()
-            print("called for pin {}".format(pinno))
-            if self._disable_when_changed_handler:
-                print('No-op')
-                return
-            print('Something detected ticks={} state={}'.format(ticks, state))
-            self.probe()
-
-    def _probe_keypad(self):
+    def _read(self):
         """
         Reads the actual state of the keypad.
 
         It doesn't matter if it queries rows or columns, as the behavior and
         the number of steps would be the same. This implementation just picked
         one of two approaches.
+
+        Technically, if a matrix keypad includes a direction-enforcing
+        component such as a diode on each line, then the choice of rows first
+        or cols first (as well as pulling high or low) would lead to different
+        results. However, almost all matrix keypads are very simple, containing
+        nothing other than the buttons themselves. Such keypads assume the user
+        will not press multiple keys at once.
+
+        If you have a "smarter" keypad, feel free to subclass this component to
+        adapt to your needs. (And share your changes with the rest of the
+        world.)
         """
 
-        self._disable_when_changed_handler = True
-        self._reset_pins()
+        with self._probe_lock:
+            self._reset_pins()
 
-        pressed = set()
-        for rowno, row in enumerate(self.row_pins):
-            # Set this row as active.
-            row.pin.output_with_state(0)
+            pressed = set()
+            self._last_read_was_ambiguous = False
+            potentially_ambiguous = False
+            for rowno, row in enumerate(self.row_pins):
+                # Set this row as active, pulling it low.
+                row.pin.output_with_state(0)
 
-            # If a button is pressed in this row, we expect to read it from the column.
-            for colno, col in enumerate(self.col_pins):
-                if col.pin.state == 0:
-                    print('Found row {} and col {}.'.format(rowno, colno))
-                    pressed.add((rowno, colno))
+                # If a button is pressed in this row, we expect to read it from the column.
+                for colno, col in enumerate(self.col_pins):
+                    if col.pin.state == 0:
+                        pressed.add((rowno, colno))
 
-            for rowno2, row2 in enumerate(self.row_pins):
-                if rowno2 != rowno:
-                    if row2.pin.state == 0:
-                        print('Rows {} and {} are active.'.format(rowno, rowno2))
+                for rowno2, row2 in enumerate(self.row_pins):
+                    if rowno2 != rowno:
+                        if row2.pin.state == 0:
+                            potentially_ambiguous = True
 
-            row.pin.input_with_pull('up')
+                row.pin.input_with_pull('up')
 
-        self._disable_when_changed_handler = False
-        # This timer avoids the infinite loop of calling the function.
-        # But it also misses short keypresses. Dang!
-        Timer(0.01, self._setup_pins_for_waiting).start()
-        return pressed
+            if potentially_ambiguous:
+                self._last_read_was_ambiguous = self.is_it_ambiguous(pressed)
 
-    def probe(self):
+            self._last_value = pressed
+            return pressed
+
+    @property
+    def last_read_was_ambiguous(self):
         """
-        Quick and dirty debugging function. Should be replaced by the proper thing (whatever that thing turns out to be).
+        Boolean value, returns True if the last known state was ambiguous.
+
+        When there are three or more buttons pressed at the same time, it is
+        possible the keypad will return ghost button presses (i.e. it thinks a
+        button is pressed while it isn't). If you don't need to deal with this
+        large amount of simultaneous button presses, you don't need to worry
+        about ambiguity.
+
+        This property is updated any time :meth:`_read` gets called, which
+        happens any time :attr:`value` is read or :attr:`values` is consumed.
+        Thus, if you're dealing with multiple threads or complex code, this
+        property might be outdated by the time you read it. However, it's a
+        simple solution for most common use-cases.
+
+        A "better" solution would be to include this information into the
+        output value itself, but that makes the output value more complicated
+        than what most people need. (Most people just need a single button
+        press.)
+
+        If you need to check if a certain value is ambiguous, without any
+        racing conditions, just call :meth:`is_it_ambiguous`.
+        """
+        return self._last_read_was_ambiguous
+
+    def is_it_ambiguous(self, set_of_tuples):
+        """
+        Given a value in the format of set of tuples of row/col coords, returns
+        True if this value is ambiguous.
+
+        Matrix keypads are extremely simple devices: one wire for each row, one
+        wire for each column, and a button connecting each row/column pair.
+        Thus, if three buttons are pressed in a certain way (sharing both a
+        row wire and a column wire), then a fourth button press will be read by
+        the circuit, even if that fourth button is not pressed. In such case,
+        the value is ambiguous, because the code reads four buttons, but it's
+        impossible to know if all four are pressed, or which one of those four
+        buttons is not pressed.
+
+        As another way to understand it, any read that contains four buttons as
+        corners of a rectangle is ambiguous.
+
+        If you are confused, just remember:
+
+        * Zero buttons pressed are never ambiguous.
+        * One button pressed is never ambiguous.
+        * Two buttons pressed is never ambiguous.
+        * Three buttons read as pressed is never ambiguous.
+        * Four or more buttons read as pressed may be ambiguous (i.e. may
+        include ghost presses).
         """
 
-        pressed = self._probe_keypad()
-        print("Pressed: " + " ".join(self.labels[rowno][colno] for (rowno, colno) in sorted(pressed)))
+        items_per_row = defaultdict(list)
+        items_per_col = defaultdict(list)
 
-        # Ideas:
-        # * Get inspired by https://github.com/adafruit/Adafruit_CircuitPython_MatrixKeypad/blob/main/adafruit_matrixkeypad.py
-        # * Get inspired by pad4pi code, and use interrupts to detect keypresses as quickly as possible.
-        # * Setup:
-        #   - All pins are input.
-        #   - Choose one line (either row or col), set as output. This will provide "power" to detect an edge later.
-        #      - Actually, we need to set all lines.
-        #   - Set all pins from the perpendicular line as detecting an edge, and provide a callback function.
-        #
-        # * Callback function:
-        #   - Start by disabling further calls to this function until later.
-        #   - Run the polling algorithm (disable all but one line, read, repeat for the next line, repeat…)
-        #      - "Disable" means switching to INPUT.
-        #   - The result will be zero, one, or many keys detected.
-        #   - Re-enable the function. Must test if it's not being called multiple times. Looking at the ticks parameter might help.
-        #
-        # * We probably need multiple callback functions, one per line.
-        #
-        # * We should have some methods: _setup_pins_for_waiting, _probe_keys
+        for (rowno, colno) in set_of_tuples:
+            items_per_row[rowno].append(colno)
+            items_per_col[colno].append(rowno)
 
+        for row in items_per_row.values():
+            if len(row) > 1:
+                for colno in row:
+                    if len(items_per_col[colno]) > 1:
+                        return True
 
-        # Bad ideas:
-        # * Check which is longer: rows or cols. Then use the longer as input,
-        #   and the shorter as output. Actually, scrap that, there is no time
-        #   difference.
+        return False
 
-        # TODO: Implement bounce_time ourselves. Look at line 362 from
-        #       https://sourceforge.net/p/raspberry-gpio-python/code/ci/default/tree/source/event_gpio.c
-        # TODO: Implement hold and hold_repeat. Look at HoldMixin.
-
-        #raise NotImplementedError('This code is in a very early state.')
 
 if __name__ == "__main__":
     kp = MatrixKeypad(
@@ -230,6 +262,15 @@ if __name__ == "__main__":
         cols=[5, 6, 13],
         labels=["123", "456", "789", "*0#"],
     )
+
+    # import time
+    # for f in ['labels', 'coords', 'rowfirstsequence', 'colfirstsequence', 'bad']:
+    #     print('----> {}'.format(f))
+    #     kp.output_format = f
+    #     for i,v in zip(range(10), kp.values):
+    #         print(i, v, kp.last_read_was_ambiguous)
+    #         time.sleep(1)
+
     input('Press Enter to quit.')
 
 # from pad4pi.rpi_gpio import KeypadFactory
